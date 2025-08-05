@@ -1,0 +1,36 @@
+// The format of this file is specified in https://probe.rs/docs/tools/vscode/#start-a-debug-session-with-minimum-configuration
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "preLaunchTask": "rust: cargo build",
+            "type": "probe-rs-debug",
+            "request": "launch",
+            "name": "rp235x-project",
+            "cwd": "${workspaceFolder}",
+            "chip": "RP235x", // Change this to the specific RP235x chip you are using, e.g., "rp2350"
+            // RP2040 doesn't support connectUnderReset
+            "connectUnderReset": false,
+            "speed": 4000,
+            "runtimeExecutable": "probe-rs",
+            "runtimeArgs": [
+                "dap-server"
+            ],
+            "flashingConfig": {
+                "flashingEnabled": true,
+                "haltAfterReset": true,
+            },
+            "coreConfigs": [
+                {
+                    "coreIndex": 0,
+                    "programBinary": "${workspaceFolder}/target/thumbv8m.main-none-eabihf/debug/${workspaceFolderBasename}",
+                    "svdFile": "./.vscode/rp2350.svd",
+                    "rttEnabled": true,
+                }
+            ],
+            "consoleLogLevel": "Info", //Error, Warn, Info, Debug, Trace
+            "wireProtocol": "Swd",
+            
+        }
+    ]
+}
