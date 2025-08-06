@@ -17,8 +17,8 @@ MEMORY {
      * of access times.
      * Example: Separate stacks for core0 and core1.
      */
-    SRAM4 : ORIGIN = 0x20080000, LENGTH = 4K
-    SRAM5 : ORIGIN = 0x20081000, LENGTH = 4K
+    SRAM8 : ORIGIN = 0x20080000, LENGTH = 4K
+    SRAM9 : ORIGIN = 0x20081000, LENGTH = 4K
 }
 
 SECTIONS {
@@ -73,5 +73,3 @@ SECTIONS {
 
 PROVIDE(start_to_end = __end_block_addr - __start_block_addr);
 PROVIDE(end_to_start = __start_block_addr - __end_block_addr);
-
-

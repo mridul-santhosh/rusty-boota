@@ -1,2 +1,7 @@
-# rusty-boota
-**rusty-boota** is a lightweight OTA (Over-The-Air) bootloader for the Raspberry Pi Pico W 2, written entirely in Rust.   It allows wireless firmware updates, enabling remote deployment and upgrades without physical access to the device.
+# embassy-pico-template
+
+A template for running an application in Rust on Raspberry Pi Pico (W) using [Embassy](https://github.com/embassy-rs/embassy).
+
+Requires the rust nightly toolchain for some dependencies and traits.
+
+License is MIT or Apache 2.0.

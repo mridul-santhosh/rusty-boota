@@ -1,119 +1,143 @@
+//! This example uses the RP Pico W board Wifi chip (cyw43).
+//! Creates an Access point Wifi network and creates a TCP endpoint on port 1234.
+
 #![no_std]
 #![no_main]
+#![allow(async_fn_in_trait)]
 
-use rp235x_hal as hal;
-use embedded_hal::delay::DelayNs;
-use embedded_hal::spi::FullDuplex;
-use embedded_hal::digital::OutputPin;
-use core::fmt::Write; // For core::write! if you want to log over UART etc.
-use hal::fugit::RateExtU32;
-use panic_halt as _;
+use core::str::from_utf8;
 
-// CYW43439 register addresses (from datasheet)
-const GPIO_DIR_REG: u32 = 0x10006a;
-const GPIO_OUT_REG: u32 = 0x10006c;
+use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
+use defmt::*;
+use embassy_executor::Spawner;
+use embassy_net::tcp::TcpSocket;
+use embassy_net::{Config, StackResources};
+use embassy_rp::bind_interrupts;
+use embassy_rp::clocks::RoscRng;
+use embassy_rp::gpio::{Level, Output};
+use embassy_rp::peripherals::{DMA_CH0, PIO0};
+use embassy_rp::pio::{InterruptHandler, Pio};
+use embassy_time::Duration;
+use embedded_io_async::Write;
+use static_cell::StaticCell;
+use {defmt_rtt as _, panic_probe as _};
 
-// Helper: format a gSPI write command for a 1-byte register write (per datasheet 4.2.1, Figure 12)
-// F1:F0=0b01 (function 1), C=1 (write), A=0 (fixed), Addr=17bit, Length=1
-fn gspi_write_cmd(addr: u32, value: u8) -> [u8; 5] {
-    // Function = 0b01, Command = 1, Addr Mode = 0 (fixed), Address = 17bits, Length = 1
-    let cmd: u32 = (0b01 << 30) | (1 << 29) | (0 << 28)
-        | ((addr & 0x1FFFF) << 11)
-        | 1; // length = 1
-    [
-        ((cmd >> 24) & 0xFF) as u8,
-        ((cmd >> 16) & 0xFF) as u8,
-        ((cmd >> 8 ) & 0xFF) as u8,
-        ((cmd      ) & 0xFF) as u8,
-        value,
-    ]
+bind_interrupts!(struct Irqs {
+    PIO0_IRQ_0 => InterruptHandler<PIO0>;
+});
+
+#[embassy_executor::task]
+async fn cyw43_task(runner: cyw43::Runner<'static, Output<'static>, PioSpi<'static, PIO0, 0, DMA_CH0>>) -> ! {
+    runner.run().await
 }
 
-#[hal::entry]
-fn main() -> ! {
-    let mut pac = hal::pac::Peripherals::take().unwrap();
+#[embassy_executor::task]
+async fn net_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'static>>) -> ! {
+    runner.run().await
+}
 
-    const XTAL_FREQ_HZ: u32 = 12_000_000u32;
+#[embassy_executor::main]
+async fn main(spawner: Spawner) {
+    info!("Hello World!");
 
-    // Setup clocks
-    let mut watchdog = hal::watchdog::Watchdog::new(pac.WATCHDOG);
-    let clocks = hal::clocks::init_clocks_and_plls(
-        XTAL_FREQ_HZ,
-        pac.XOSC,
-        pac.CLOCKS,
-        pac.PLL_SYS,
-        pac.PLL_USB,
-        &mut pac.RESETS,
-        &mut watchdog,
-    )
-    .unwrap();
+    let p = embassy_rp::init(Default::default());
+    let mut rng = RoscRng;
 
-    // Setup pins per Pico 2 W wireless interface wiring
-    let sio = hal::sio::Sio::new(pac.SIO);
-    let pins = hal::gpio::Pins::new(
-        pac.IO_BANK0,
-        pac.PADS_BANK0,
-        sio.gpio_bank0,
-        &mut pac.RESETS,
-    );
-    // SPI pins for wireless, Pico 2 W: CS= GPIO25, D(DIN/DOUT/IRQ)=GPIO24, CLK=GPIO29
-    let mut cs_pin = pins.gpio25.into_push_pull_output();
-    let spi_d = pins.gpio24.into_function::<hal::gpio::FunctionSpi>();
-    let spi_clk = pins.gpio29.into_function::<hal::gpio::FunctionSpi>();
+    let fw = include_bytes!("/home/zenith/Projects/open-source/tools/embassy/cyw43-firmware/43439A0.bin");
+    let clm = include_bytes!("/home/zenith/Projects/open-source/tools/embassy/cyw43-firmware/43439A0_clm.bin");
 
-    // For simplicity, use both MOSI and MISO as D (same GPIO) — the HAL's SPI expects a tuple.
-    let spi = hal::spi::Spi::<_, _, _, 8>::new(pac.SPI0, (spi_d, spi_d, spi_clk));
+    // To make flashing faster for development, you may want to flash the firmwares independently
+    // at hardcoded addresses, instead of baking them into the program with `include_bytes!`:
+    //     probe-rs download 43439A0.bin --binary-format bin --chip RP2040 --base-address 0x10100000
+    //     probe-rs download 43439A0_clm.bin --binary-format bin --chip RP2040 --base-address 0x10140000
+    //let fw = unsafe { core::slice::from_raw_parts(0x10100000 as *const u8, 230321) };
+    //let clm = unsafe { core::slice::from_raw_parts(0x10140000 as *const u8, 4752) };
 
-    let mut spi = spi.init(
-        &mut pac.RESETS,
-        clocks.peripheral_clock.freq(),
-        16_000_000u32.Hz(),
-        embedded_hal::spi::MODE_0,
+    let pwr = Output::new(p.PIN_23, Level::Low);
+    let cs = Output::new(p.PIN_25, Level::High);
+    let mut pio = Pio::new(p.PIO0, Irqs);
+    let spi = PioSpi::new(
+        &mut pio.common,
+        pio.sm0,
+        RM2_CLOCK_DIVIDER,
+        pio.irq0,
+        cs,
+        p.PIN_24,
+        p.PIN_29,
+        p.DMA_CH0,
     );
 
-    let mut delay = hal::Timer::new_timer0(pac.TIMER0, &mut pac.RESETS, &clocks);
-    let mut led_pin = pins.gpio25.into_push_pull_output(); // Reuse as user indicator
+    static STATE: StaticCell<cyw43::State> = StaticCell::new();
+    let state = STATE.init(cyw43::State::new());
+    let (net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw).await;
+    unwrap!(spawner.spawn(cyw43_task(runner)));
 
-    // Minimal: delay to let CYW43439 power up
-    delay.delay_ms(50);
+    control.init(clm).await;
+    control
+        .set_power_management(cyw43::PowerManagementMode::PowerSave)
+        .await;
 
-    // 1. Set CYW43439 GPIO0 as output (write 0x01 to DIR register)
-    let dir_cmd = gspi_write_cmd(GPIO_DIR_REG, 0x01);
-    cs_pin.set_low().unwrap();
-    for b in dir_cmd.iter() {
-        let _ = nb::block!(spi.send(*b));
-        let _ = nb::block!(spi.read());
-    }
-    cs_pin.set_high().unwrap();
-    delay.delay_ms(1); // Short delay between ops
+    // Use a link-local address for communication without DHCP server
+    let config = Config::ipv4_static(embassy_net::StaticConfigV4 {
+        address: embassy_net::Ipv4Cidr::new(embassy_net::Ipv4Address::new(169, 254, 1, 1), 16),
+        dns_servers: heapless::Vec::new(),
+        gateway: None,
+    });
 
-    // 2. Set CYW43439 GPIO0 'high' (write 0x01 to OUT register)
-    let out_cmd = gspi_write_cmd(GPIO_OUT_REG, 0x01);
-    cs_pin.set_low().unwrap();
-    for b in out_cmd.iter() {
-        let _ = nb::block!(spi.send(*b));
-        let _ = nb::block!(spi.read());
-    }
-    cs_pin.set_high().unwrap();
+    // Generate random seed
+    let seed = rng.next_u64();
 
-    // (Optional: Readback or check status -- omitted for clarity)
+    // Init network stack
+    static RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
+    let (stack, runner) = embassy_net::new(net_device, config, RESOURCES.init(StackResources::new()), seed);
 
-    // Indicate success: slow blink
+    unwrap!(spawner.spawn(net_task(runner)));
+
+    //control.start_ap_open("cyw43", 5).await;
+    control.start_ap_wpa2("cyw43", "password", 5).await;
+
+    // And now we can use it!
+
+    let mut rx_buffer = [0; 4096];
+    let mut tx_buffer = [0; 4096];
+    let mut buf = [0; 4096];
+
     loop {
-        led_pin.set_high().unwrap();
-        delay.delay_ms(500);
-        led_pin.set_low().unwrap();
-        delay.delay_ms(500);
+        let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+        socket.set_timeout(Some(Duration::from_secs(10)));
+
+        control.gpio_set(0, false).await;
+        info!("Listening on TCP:1234...");
+        if let Err(e) = socket.accept(1234).await {
+            warn!("accept error: {:?}", e);
+            continue;
+        }
+
+        info!("Received connection from {:?}", socket.remote_endpoint());
+        control.gpio_set(0, true).await;
+
+        loop {
+            let n = match socket.read(&mut buf).await {
+                Ok(0) => {
+                    warn!("read EOF");
+                    break;
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    warn!("read error: {:?}", e);
+                    break;
+                }
+            };
+
+            info!("rxd {}", from_utf8(&buf[..n]).unwrap());
+
+            match socket.write_all(&buf[..n]).await {
+                Ok(()) => {}
+                Err(e) => {
+                    warn!("write error: {:?}", e);
+                    break;
+                }
+            };
+        }
     }
 }
-
-/// Program metadata for `picotool info`
-#[link_section = ".bi_entries"]
-#[used]
-pub static PICOTOOL_ENTRIES: [hal::binary_info::EntryAddr; 5] = [
-    hal::binary_info::rp_cargo_bin_name!(),
-    hal::binary_info::rp_cargo_version!(),
-    hal::binary_info::rp_program_description!(c"Set CYW43439 GPIO0 via gSPI"),
-    hal::binary_info::rp_cargo_homepage_url!(),
-    hal::binary_info::rp_program_build_attribute!(),
-];
